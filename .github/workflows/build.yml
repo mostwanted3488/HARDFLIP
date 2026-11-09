@@ -1,0 +1,120 @@
+name: Build HARDFLIP
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dsp-tests:
+    name: DSP precision tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra Tests/dsp_test.cpp -o dsp_test
+          set -o pipefail
+          ./dsp_test | tee dsp_report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsp-report
+          path: dsp_report.txt
+
+  macos:
+    name: macOS (VST3 + AU, universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --target HARDFLIP_VST3 HARDFLIP_AU -j 4
+      - name: Sign (ad-hoc)
+        run: |
+          VST3=$(find build -name "HARDFLIP.vst3" -type d | head -1)
+          AU=$(find build -name "HARDFLIP.component" -type d | head -1)
+          codesign --force --deep -s - "$VST3"
+          codesign --force --deep -s - "$AU"
+      - name: Verify bundle (signature, architectures, embedded UI)
+        continue-on-error: true
+        run: |
+          VST3=$(find build -name "HARDFLIP.vst3" -type d | head -1)
+          codesign --verify --deep --strict -v "$VST3"
+          plutil -p "$VST3/Contents/Info.plist"
+          lipo -archs "$VST3/Contents/MacOS/HARDFLIP"
+          otool -L "$VST3/Contents/MacOS/HARDFLIP" | grep -E "WebKit|CoreAudio" || true
+          echo "native bridge strings in binary: $(strings -a "$VST3/Contents/MacOS/HARDFLIP" | grep -c hfGetState)"
+      - name: pluginval - loads the VST3 in a test host, runs audio, automation, state and editor tests
+        timeout-minutes: 20
+        continue-on-error: true
+        run: |
+          curl -sSL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip
+          unzip -q pv.zip
+          VST3=$(find build -name "HARDFLIP.vst3" -type d | head -1)
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --validate-in-process --verbose "$VST3" 2>&1 | tee pluginval-vst3.txt
+      - name: pluginval strictness 10 (informational, hardest level)
+        timeout-minutes: 25
+        continue-on-error: true
+        run: |
+          VST3=$(find build -name "HARDFLIP.vst3" -type d | head -1)
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 10 --validate-in-process --verbose "$VST3" 2>&1 | tee pluginval10-vst3.txt
+      - name: auval - Apple's Audio Unit validator
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "$(find build -name "HARDFLIP.component" -type d | head -1)" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 2
+          auval -v aufx Hflp Bobl 2>&1 | tee auval.txt
+      - name: Package (ad-hoc signed)
+        run: |
+          set -e
+          mkdir -p dist
+          VST3=$(find build -name "HARDFLIP.vst3" -type d | head -1)
+          AU=$(find build -name "HARDFLIP.component" -type d | head -1)
+          codesign --force --deep -s - "$VST3"
+          codesign --force --deep -s - "$AU"
+          lipo -archs "$VST3/Contents/MacOS/HARDFLIP"
+          cp -R "$VST3" dist/
+          cp -R "$AU" dist/
+          cp README.md dist/
+          cd dist && ditto -c -k --keepParent . ../HARDFLIP-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HARDFLIP-macOS
+          path: HARDFLIP-macOS.zip
+
+  windows:
+    name: Windows (VST3)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: WebView2 SDK
+        shell: pwsh
+        run: nuget install Microsoft.Web.WebView2 -OutputDirectory "$env:GITHUB_WORKSPACE\nuget"
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DJUCE_WEBVIEW2_PACKAGE_LOCATION=${{ github.workspace }}/nuget"
+      - name: Build
+        run: cmake --build build --config Release --target HARDFLIP_VST3 -j 4
+      - name: pluginval - loads the VST3 in a test host
+        timeout-minutes: 20
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pv.zip
+          Expand-Archive pv.zip -DestinationPath pv
+          $v = Get-ChildItem -Path build -Recurse -Directory -Filter "HARDFLIP.vst3" | Select-Object -First 1
+          .\pv\pluginval.exe --strictness-level 5 --validate-in-process --verbose $v.FullName 2>&1 | Tee-Object -FilePath pluginval-win.txt
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $v = Get-ChildItem -Path build -Recurse -Directory -Filter "HARDFLIP.vst3" | Select-Object -First 1
+          Copy-Item $v.FullName dist -Recurse
+          Compress-Archive -Path dist\* -DestinationPath HARDFLIP-Windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HARDFLIP-Windows
+          path: HARDFLIP-Windows.zip
